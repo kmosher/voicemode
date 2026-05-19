@@ -286,6 +286,12 @@ async def stream_pcm_audio(
         ) as response:
             chunk_count = 0
             bytes_received = 0
+            # response.iter_bytes() does not guarantee frame-aligned chunks
+            # (chunk_size is a max). Carry any partial trailing frame forward
+            # to the next iteration so a stereo first-chunk-after-header
+            # (4096-44=4052 bytes = 1013.5 stereo frames) or an odd-byte tail
+            # at EOF doesn't crash np.frombuffer / reshape.
+            leftover = b''
 
             async for chunk in response.iter_bytes(chunk_size=STREAM_CHUNK_SIZE):
                 if not chunk:
@@ -298,12 +304,27 @@ async def stream_pcm_audio(
                         event_logger.log_event(event_logger.TTS_FIRST_AUDIO)
 
                 if not header_consumed:
-                    # macos-speech-server documents a standard 44-byte PCM/16-bit
-                    # RIFF header. STREAM_CHUNK_SIZE (4096) is much larger, so the
-                    # whole header lands in the first chunk under any plausible
-                    # network condition.
-                    if len(chunk) < 44 or chunk[:4] != b'RIFF' or chunk[8:12] != b'WAVE':
-                        logger.error(f"Malformed WAV stream start: {chunk[:16]!r}")
+                    # Validate strictly against the canonical 44-byte PCM/16-bit
+                    # RIFF header: 'fmt ' chunk of size 16, format tag 1 (PCM),
+                    # immediately followed by the 'data' chunk. This catches
+                    # WAVEFORMATEXTENSIBLE (extended fmt chunk), companded
+                    # (A-law/μ-law) WAVs whose bits_per_sample still reports
+                    # 16, and any LIST/JUNK chunk between fmt and data — all
+                    # of which would otherwise misalign the audio bytes or
+                    # play companded data as linear int16.
+                    if (
+                        len(chunk) < 44
+                        or chunk[:4] != b'RIFF'
+                        or chunk[8:12] != b'WAVE'
+                        or chunk[12:16] != b'fmt '
+                        or int.from_bytes(chunk[16:20], 'little') != 16
+                        or chunk[36:40] != b'data'
+                    ):
+                        logger.error(f"Unsupported WAV stream start: {chunk[:40]!r}")
+                        return False, metrics
+                    fmt_tag = int.from_bytes(chunk[20:22], 'little')
+                    if fmt_tag != 1:
+                        logger.error(f"Unsupported WAV format tag: {fmt_tag} (only linear PCM tag=1 is supported)")
                         return False, metrics
                     channels = int.from_bytes(chunk[22:24], 'little')
                     sample_rate = int.from_bytes(chunk[24:28], 'little')
@@ -322,24 +343,32 @@ async def stream_pcm_audio(
                         event_logger.log_event(event_logger.TTS_PLAYBACK_START)
                     chunk = chunk[44:]
                     header_consumed = True
-                    if not chunk:
-                        continue
-
-                audio_array = np.frombuffer(chunk, dtype=np.int16)
-                if channels > 1:
-                    audio_array = audio_array.reshape(-1, channels)
-                stream.write(audio_array)
-
-                if save_buffer:
-                    save_buffer.write(chunk)
 
                 chunk_count += 1
                 bytes_received += len(chunk)
                 metrics.chunks_received = chunk_count
                 metrics.chunks_played = chunk_count
 
+                # Combine with any partial frame from the previous iteration,
+                # write only whole frames, carry the remainder forward.
+                merged = leftover + chunk
+                frame_bytes = 2 * channels
+                usable = (len(merged) // frame_bytes) * frame_bytes
+                leftover = merged[usable:]
+                if not usable:
+                    continue
+                audio_array = np.frombuffer(merged[:usable], dtype=np.int16)
+                if channels > 1:
+                    audio_array = audio_array.reshape(-1, channels)
+                stream.write(audio_array)
+                if save_buffer:
+                    save_buffer.write(merged[:usable])
+
                 if debug and chunk_count % 10 == 0:
                     logger.debug(f"Streamed {chunk_count} chunks, {bytes_received} bytes")
+
+        if leftover:
+            logger.debug(f"Discarding {len(leftover)} trailing bytes (partial frame at EOF)")
 
         # Pad with trailing silence and explicitly drain before stop(): on macOS
         # CoreAudio (especially aggregate devices) stream.stop() doesn't reliably
@@ -385,9 +414,12 @@ async def stream_pcm_audio(
                 from .core import save_debug_file
                 save_buffer.seek(0)
                 audio_data = save_buffer.read()
-                # PCM format needs special handling - save as WAV
+                # Re-wrap the accumulated raw int16 stream as a self-contained
+                # WAV file for the on-disk artifact — applies whether the wire
+                # format was pcm (no header at all) or wav (header was stripped
+                # off chunk 0 before playback). Reconstructs from the parsed
+                # sample_rate/channels so the saved file matches the played one.
                 if audio_data:
-                    # For PCM, we need to save as WAV with proper headers
                     import wave
                     import tempfile
                     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
@@ -414,7 +446,7 @@ async def stream_pcm_audio(
         return True, metrics
         
     except Exception as e:
-        logger.error(f"PCM streaming failed: {e}")
+        logger.error(f"{format.upper()} streaming failed: {e}")
         return False, metrics
         
     finally:
