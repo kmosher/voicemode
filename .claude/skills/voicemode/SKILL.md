@@ -106,6 +106,17 @@ Some hosts (e.g. newer Claude Code) collapse MCP tool calls — voice turns vani
 - Don't double-echo: if a sentence already appears as visible prose in the same response, don't also blockquote it.
 - **Disable on request** — canonical phrase: **"disable voicemode echo"**. Stop echoing for the rest of the session and honour the same phrase if it appears in the user's startup context (some hosts already render voice tool calls inline, where echoes would double up).
 
+## Speak-assistant mode (opt-in)
+
+When the user asks for the *reverse* of echo — "also speak what you write", "read your replies aloud", "audio mode on" — enter **speak-assistant mode** for the rest of the session.
+
+In this mode, after each visible text reply, also call `voicemode:converse` with `wait_for_response=false` to speak an ear-friendly version of the same content.
+
+- **Shorten for the ear.** Drop code blocks, file paths, URLs, long enumerations. Conversational phrasing — "the function at line 1214" not `voice_mode/tools/converse.py:1214`. One or two sentences when the text reply is long; near-verbatim when it's already short.
+- **Skip the spoken echo** for: pure code dumps, raw tool outputs the user explicitly asked for, replies that are essentially "done" with no information to convey.
+- **Don't double-speak.** If a `converse` with `wait_for_response=true` already happened this turn (the user spoke to you), that IS the spoken reply — don't add a second one.
+- **Disable on request** — canonical phrase: **"stop speaking your replies"** or "speak-assistant off". Turn the behaviour off for the rest of the session.
+
 ## Parallel Tool Calls (Zero Dead Air)
 
 Eliminate dead air by sending voice and action calls in the **same response**:
