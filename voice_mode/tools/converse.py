@@ -1405,6 +1405,15 @@ consult the MCP resources listed above.
     # "no override" — fall back to the resolved profile/sidecar transcript.
     resolved_ref_text = resolve_ref_text(ref_text)
 
+    # Signal to the PermissionRequest hook that this Claude session is using
+    # voice, so the hook prompts by voice instead of TTY. Scoped via
+    # $CLAUDE_CODE_TMPDIR; safe no-op if the env var is missing.
+    try:
+        from voice_mode.permission_hook import mark_voice_active
+        mark_voice_active()
+    except Exception as e:
+        logger.debug(f"mark_voice_active failed (non-fatal): {e}")
+
     # Convert vad_aggressiveness to integer if provided as string
     if vad_aggressiveness is not None and isinstance(vad_aggressiveness, str):
         try:
