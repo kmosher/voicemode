@@ -320,10 +320,22 @@ async def stream_pcm_audio(
                     
                     if debug and chunk_count % 10 == 0:
                         logger.debug(f"Streamed {chunk_count} chunks, {bytes_received} bytes")
-        
-        # Wait for playback to finish
+
+        # Pad with trailing silence and explicitly drain before stop(): on macOS
+        # CoreAudio (especially aggregate devices) stream.stop() doesn't reliably
+        # wait for the output buffer to flush, so the last real chunk gets
+        # clipped. Mirrors stream_with_buffering's drain pattern for the same
+        # reason. The bug is masked by TTS servers whose synthesis includes
+        # natural trailing silence; it surfaces clearly with servers that
+        # finish synthesis at connection close (e.g. macos-speech-server's
+        # sentence-by-sentence streaming).
+        if TTS_TRAILING_SILENCE > 0:
+            pad = np.zeros(int(SAMPLE_RATE * TTS_TRAILING_SILENCE), dtype=np.int16)
+            stream.write(pad)
+        drain_secs = (stream.latency or 0.0) + 0.3
+        await asyncio.sleep(drain_secs)
         stream.stop()
-        
+
         end_time = time.perf_counter()
 
         # Log TTS playback end with metrics
