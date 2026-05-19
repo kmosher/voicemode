@@ -5,7 +5,15 @@ description: Voice interaction for Claude Code. Use when users mention voice mod
 
 ## First-Time Setup
 
-If VoiceMode isn't working or MCP fails to connect, run:
+**Before suggesting any install**, check what's already running:
+
+```bash
+voicemode service status
+```
+
+If `mlx-audio` is running (Apple Silicon's preferred unified path), no install is needed — STT and TTS both come from port 8890. Do not run `/voicemode:install` in that case; do not suggest installing whisper/kokoro alongside mlx-audio. The classic `kokoro: not_installed` / `whisper: not_installed` rows in `voicemode status` are informational, not errors, when mlx-audio is in use.
+
+If nothing is running and the MCP fails to connect, then run:
 
 ```
 /voicemode:install
