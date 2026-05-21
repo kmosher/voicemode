@@ -78,6 +78,63 @@ drift. See [voices resource reference](../../docs/reference/voices-resource.md).
 
 For all parameters, see [Converse Parameters](../../docs/reference/converse-parameters.md).
 
+## Announce mode (fire-and-forget end-of-task notifications)
+
+Use the `announce` MCP tool — **not** `converse` — when you just want to
+tell the user something out loud without waiting for the audio or
+capturing a spoken response. Designed for "build done", "PR merged",
+"agent X finished" patterns, especially when **multiple Claude sessions
+run in parallel** and each needs its own distinct voice.
+
+```python
+# At end of a task, in the same response as your final text:
+voicemode:announce("Build is green. PR opened.", voice="<your session id>")
+```
+
+Key differences from `converse`:
+
+| | `announce` | `converse` |
+|---|---|---|
+| Returns | <100ms (before audio plays) | After full ~5-15s gen + playback |
+| Listens for response | No | Yes (unless `wait_for_response=false`) |
+| Microphone / conch | No | Yes |
+| Errors | Logged silently | Returned to caller |
+| Best for | "Done with X" announcements | Two-way conversation |
+
+**Voice = your session ID.** Pass any stable string — your session ID is
+ideal — as the `voice` parameter. Anything that isn't already a known
+Kokoro voice (`af_*`, `am_*`, `bf_*`, `bm_*`, `claude_*`, `blend_*`) is
+SHA-256-hashed into a deterministic `claude_<hex>` voice ID. The
+underlying speech server materializes a per-bucket blended Kokoro voice
+on first use; the same seed always produces the same voice. Different
+Claude sessions get audibly different voices with zero coordination.
+
+If you don't know your session ID, pass any stable identifier you can
+derive (cwd + start time, PID + hostname, anything stable for the life
+of the session). Don't use a random per-call value — you'll get a
+different voice every utterance, which defeats the point.
+
+**Echo rule applies the same as `converse`:** write the ASSISTANT
+blockquote *before* the tool call. (No USER echo — `announce` never
+captures a response.)
+
+```
+> **ASSISTANT (voicemode):** Build is green. PR opened.
+[voicemode:announce tool call]
+```
+
+**Parallel with work, not after it.** Because `announce` returns
+immediately, the right pattern is to fire it alongside whatever you're
+doing next (or even in the same response as your text reply ending the
+turn), not as a blocking call that holds the user up.
+
+```
+# GOOD: announce + return turn — user gets control back immediately,
+# audio plays while they read your final text.
+voicemode:announce("Done. Three tests added, all green.", voice="<session id>")
+[end of response — user can keep typing while audio plays]
+```
+
 ## Best Practices
 
 1. **Narrate without waiting** - Use `wait_for_response=False` when announcing actions
