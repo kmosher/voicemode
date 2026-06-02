@@ -9,13 +9,21 @@ Install VoiceMode and all dependencies needed for voice conversations.
 
 ## Quick Install (Non-Interactive)
 
-For a fast, fully automated install on Apple Silicon:
+**On Apple Silicon, prefer the unified mlx-audio service** — it provides both STT and TTS in one process, sidesteps the C++ toolchain whisper.cpp needs, and has no separate kokoro process to manage:
 
 ```bash
 uvx voice-mode-install --yes
+voicemode service install mlx-audio
+```
+
+Only fall back to the separate whisper + kokoro services if mlx-audio is not viable (non-Apple-Silicon, or user explicitly wants the classic stack):
+
+```bash
 voicemode service install whisper
 voicemode service install kokoro
 ```
+
+Before installing, check whether the user already has mlx-audio running locally — many setups already do, and installing whisper/kokoro on top is wasted work.
 
 ## What Gets Installed
 
@@ -23,8 +31,9 @@ voicemode service install kokoro
 |-----------|------|---------|
 | FFmpeg | ~50MB | Audio processing (via Homebrew) |
 | VoiceMode CLI | ~10MB | Command-line tools |
-| Whisper (base) | ~150MB | Speech-to-text |
-| Kokoro | ~350MB | Text-to-speech |
+| mlx-audio (Apple Silicon, recommended) | ~0MB binary; pulls models lazily on first use | Unified STT + TTS on port 8890 |
+| Whisper (base) | ~150MB | Classic local STT (port 2022) — only if not using mlx-audio |
+| Kokoro | ~350MB | Classic local TTS (port 8880) — only if not using mlx-audio |
 
 ## Implementation
 
@@ -41,15 +50,17 @@ voicemode service install kokoro
    # Full install (installs ffmpeg, voicemode, and checks dependencies)
    uvx voice-mode-install --yes
 
-   # Install local services
-   voicemode service install whisper
-   voicemode service install kokoro
+   # Apple Silicon: unified service (preferred)
+   voicemode service install mlx-audio
+
+   # Classic stack — only if mlx-audio isn't viable:
+   #   voicemode service install whisper
+   #   voicemode service install kokoro
    ```
 
 4. **Verify services are running:**
    ```bash
-   voicemode service status whisper
-   voicemode service status kokoro
+   voicemode service status mlx-audio   # or: whisper / kokoro if installed
    ```
 
 5. **Reconnect MCP server:**

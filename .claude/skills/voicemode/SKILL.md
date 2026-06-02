@@ -5,7 +5,15 @@ description: Voice interaction for Claude Code. Use when users mention voice mod
 
 ## First-Time Setup
 
-If VoiceMode isn't working or MCP fails to connect, run:
+**Before suggesting any install**, check what's already running:
+
+```bash
+voicemode service status
+```
+
+If `mlx-audio` is running (Apple Silicon's preferred unified path), no install is needed — STT and TTS both come from port 8890. Do not run `/voicemode:install` in that case; do not suggest installing whisper/kokoro alongside mlx-audio. The classic `kokoro: not_installed` / `whisper: not_installed` rows in `voicemode status` are informational, not errors, when mlx-audio is in use.
+
+If nothing is running and the MCP fails to connect, then run:
 
 ```
 /voicemode:install
@@ -70,6 +78,63 @@ drift. See [voices resource reference](../../docs/reference/voices-resource.md).
 
 For all parameters, see [Converse Parameters](../../docs/reference/converse-parameters.md).
 
+## Announce mode (fire-and-forget end-of-task notifications)
+
+Use the `announce` MCP tool — **not** `converse` — when you just want to
+tell the user something out loud without waiting for the audio or
+capturing a spoken response. Designed for "build done", "PR merged",
+"agent X finished" patterns, especially when **multiple Claude sessions
+run in parallel** and each needs its own distinct voice.
+
+```python
+# At end of a task, in the same response as your final text:
+voicemode:announce("Build is green. PR opened.", voice="<your session id>")
+```
+
+Key differences from `converse`:
+
+| | `announce` | `converse` |
+|---|---|---|
+| Returns | <100ms (before audio plays) | After full ~5-15s gen + playback |
+| Listens for response | No | Yes (unless `wait_for_response=false`) |
+| Microphone / conch | No | Yes |
+| Errors | Logged silently | Returned to caller |
+| Best for | "Done with X" announcements | Two-way conversation |
+
+**Voice = your session ID.** Pass any stable string — your session ID is
+ideal — as the `voice` parameter. Anything that isn't already a known
+Kokoro voice (`af_*`, `am_*`, `bf_*`, `bm_*`, `claude_*`, `blend_*`) is
+SHA-256-hashed into a deterministic `claude_<hex>` voice ID. The
+underlying speech server materializes a per-bucket blended Kokoro voice
+on first use; the same seed always produces the same voice. Different
+Claude sessions get audibly different voices with zero coordination.
+
+If you don't know your session ID, pass any stable identifier you can
+derive (cwd + start time, PID + hostname, anything stable for the life
+of the session). Don't use a random per-call value — you'll get a
+different voice every utterance, which defeats the point.
+
+**Echo rule applies the same as `converse`:** write the ASSISTANT
+blockquote *before* the tool call. (No USER echo — `announce` never
+captures a response.)
+
+```
+> **ASSISTANT (voicemode):** Build is green. PR opened.
+[voicemode:announce tool call]
+```
+
+**Parallel with work, not after it.** Because `announce` returns
+immediately, the right pattern is to fire it alongside whatever you're
+doing next (or even in the same response as your text reply ending the
+turn), not as a blocking call that holds the user up.
+
+```
+# GOOD: announce + return turn — user gets control back immediately,
+# audio plays while they read your final text.
+voicemode:announce("Done. Three tests added, all green.", voice="<session id>")
+[end of response — user can keep typing while audio plays]
+```
+
 ## Best Practices
 
 1. **Narrate without waiting** - Use `wait_for_response=False` when announcing actions
@@ -97,6 +162,17 @@ Some hosts (e.g. newer Claude Code) collapse MCP tool calls — voice turns vani
 - **Visual aids (lists, tables, code) belong AFTER the blockquote, not inside it.** The blockquote stays a clean verbatim copy of what was spoken; richer formatting can follow as separate prose.
 - Don't double-echo: if a sentence already appears as visible prose in the same response, don't also blockquote it.
 - **Disable on request** — canonical phrase: **"disable voicemode echo"**. Stop echoing for the rest of the session and honour the same phrase if it appears in the user's startup context (some hosts already render voice tool calls inline, where echoes would double up).
+
+## Speak-assistant mode (opt-in)
+
+When the user asks for the *reverse* of echo — "also speak what you write", "read your replies aloud", "audio mode on" — enter **speak-assistant mode** for the rest of the session.
+
+In this mode, after each visible text reply, also call `voicemode:converse` with `wait_for_response=false` to speak an ear-friendly version of the same content.
+
+- **Shorten for the ear.** Drop code blocks, file paths, URLs, long enumerations. Conversational phrasing — "the function at line 1214" not `voice_mode/tools/converse.py:1214`. One or two sentences when the text reply is long; near-verbatim when it's already short.
+- **Skip the spoken echo** for: pure code dumps, raw tool outputs the user explicitly asked for, replies that are essentially "done" with no information to convey.
+- **Don't double-speak.** If a `converse` with `wait_for_response=true` already happened this turn (the user spoke to you), that IS the spoken reply — don't add a second one.
+- **Disable on request** — canonical phrase: **"stop speaking your replies"** or "speak-assistant off". Turn the behaviour off for the rest of the session.
 
 ## Parallel Tool Calls (Zero Dead Air)
 

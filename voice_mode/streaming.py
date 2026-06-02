@@ -241,92 +241,151 @@ async def stream_pcm_audio(
     audio_dir: Optional[Path] = None,
     conversation_id: Optional[str] = None
 ) -> Tuple[bool, StreamMetrics]:
-    """Stream PCM audio with true HTTP streaming for minimal latency.
-    
-    Uses the OpenAI SDK's streaming response with iter_bytes() for real-time playback.
+    """Stream raw int16 audio with true HTTP streaming for minimal latency.
+
+    Handles ``response_format=pcm`` (raw int16 at SAMPLE_RATE) and
+    ``response_format=wav`` (44-byte RIFF/WAVE header followed by int16
+    samples) — WAV is treated as PCM after the header is parsed off the
+    first chunk. The header tells us the real sample rate and channel
+    count, so servers like macos-speech-server's AVSpeech engine (22050Hz)
+    play at the correct speed instead of being forced to SAMPLE_RATE.
     """
+    format = request_params.get('response_format', 'pcm')
+    is_wav = (format == 'wav')
+
     metrics = StreamMetrics()
     start_time = time.perf_counter()
     stream = None
     first_chunk_time = None
     save_buffer = io.BytesIO() if save_audio else None
-    
+    event_logger = get_event_logger()
+
+    # Stream parameters; overridden from the WAV header on the first chunk when is_wav.
+    sample_rate = SAMPLE_RATE
+    channels = 1
+    header_consumed = not is_wav
+
     try:
-        # Setup sounddevice stream for PCM playback
-        # PCM parameters: 16-bit, mono, 24kHz (standard for TTS)
-        audio_started = False
-        audio_start_time = None
-        
-        def audio_callback(outdata, frames, time_info, status):
-            """Callback to track when audio actually starts playing."""
-            nonlocal audio_started, audio_start_time
-            if not audio_started and frames > 0:
-                audio_started = True
-                audio_start_time = time.perf_counter()
-        
-        stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE,  # Standard TTS sample rate (24kHz)
-            channels=1,
-            dtype='int16'  # PCM is 16-bit integers
-            # Note: Can't use callback and write() together
-        )
-        stream.start()
-        
-        # Log TTS playback start when we start the stream
-        event_logger = get_event_logger()
-        if event_logger:
-            event_logger.log_event(event_logger.TTS_PLAYBACK_START)
-        
-        # Don't add stream parameter - Kokoro defaults to true, OpenAI doesn't support it
-        
-        logger.info("Starting true HTTP streaming with iter_bytes()")
-        
-        # Use the streaming response API
+        # For PCM the stream parameters are fixed up front. For WAV we defer
+        # OutputStream creation until the header is parsed so the device matches
+        # the file's actual rate/channels.
+        if not is_wav:
+            stream = sd.OutputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype='int16',
+            )
+            stream.start()
+            if event_logger:
+                event_logger.log_event(event_logger.TTS_PLAYBACK_START)
+
+        logger.info(f"Starting true HTTP streaming with iter_bytes() (format={format})")
+
         async with openai_client.audio.speech.with_streaming_response.create(
             **request_params
         ) as response:
             chunk_count = 0
             bytes_received = 0
-            
-            # Stream chunks as they arrive
+            # response.iter_bytes() does not guarantee frame-aligned chunks
+            # (chunk_size is a max). Carry any partial trailing frame forward
+            # to the next iteration so a stereo first-chunk-after-header
+            # (4096-44=4052 bytes = 1013.5 stereo frames) or an odd-byte tail
+            # at EOF doesn't crash np.frombuffer / reshape.
+            leftover = b''
+
             async for chunk in response.iter_bytes(chunk_size=STREAM_CHUNK_SIZE):
-                if chunk:
-                    # Track first chunk received
-                    if first_chunk_time is None:
-                        first_chunk_time = time.perf_counter()
-                        chunk_receive_time = first_chunk_time - start_time
-                        logger.info(f"First audio chunk received after {chunk_receive_time:.3f}s")
-                        
-                        # Log TTS first audio event
-                        event_logger = get_event_logger()
-                        if event_logger:
-                            event_logger.log_event(event_logger.TTS_FIRST_AUDIO)
-                    
-                    # Convert bytes to numpy array for sounddevice
-                    # PCM data is already in the right format
-                    audio_array = np.frombuffer(chunk, dtype=np.int16)
-                    
-                    # Play the chunk immediately
-                    stream.write(audio_array)
-                    
-                    # Save chunk if enabled
-                    if save_buffer:
-                        save_buffer.write(chunk)
-                    
-                    chunk_count += 1
-                    bytes_received += len(chunk)
-                    metrics.chunks_received = chunk_count
-                    metrics.chunks_played = chunk_count
-                    
-                    if debug and chunk_count % 10 == 0:
-                        logger.debug(f"Streamed {chunk_count} chunks, {bytes_received} bytes")
-        
-        # Wait for playback to finish
-        stream.stop()
-        
+                if not chunk:
+                    continue
+
+                if first_chunk_time is None:
+                    first_chunk_time = time.perf_counter()
+                    logger.info(f"First audio chunk received after {first_chunk_time - start_time:.3f}s")
+                    if event_logger:
+                        event_logger.log_event(event_logger.TTS_FIRST_AUDIO)
+
+                if not header_consumed:
+                    # Validate strictly against the canonical 44-byte PCM/16-bit
+                    # RIFF header: 'fmt ' chunk of size 16, format tag 1 (PCM),
+                    # immediately followed by the 'data' chunk. This catches
+                    # WAVEFORMATEXTENSIBLE (extended fmt chunk), companded
+                    # (A-law/μ-law) WAVs whose bits_per_sample still reports
+                    # 16, and any LIST/JUNK chunk between fmt and data — all
+                    # of which would otherwise misalign the audio bytes or
+                    # play companded data as linear int16.
+                    if (
+                        len(chunk) < 44
+                        or chunk[:4] != b'RIFF'
+                        or chunk[8:12] != b'WAVE'
+                        or chunk[12:16] != b'fmt '
+                        or int.from_bytes(chunk[16:20], 'little') != 16
+                        or chunk[36:40] != b'data'
+                    ):
+                        logger.error(f"Unsupported WAV stream start: {chunk[:40]!r}")
+                        return False, metrics
+                    fmt_tag = int.from_bytes(chunk[20:22], 'little')
+                    if fmt_tag != 1:
+                        logger.error(f"Unsupported WAV format tag: {fmt_tag} (only linear PCM tag=1 is supported)")
+                        return False, metrics
+                    channels = int.from_bytes(chunk[22:24], 'little')
+                    sample_rate = int.from_bytes(chunk[24:28], 'little')
+                    bits = int.from_bytes(chunk[34:36], 'little')
+                    if bits != 16:
+                        logger.error(f"Unsupported WAV bits-per-sample: {bits}")
+                        return False, metrics
+                    logger.info(f"WAV header parsed: {sample_rate}Hz, {channels}ch, 16-bit")
+                    stream = sd.OutputStream(
+                        samplerate=sample_rate,
+                        channels=channels,
+                        dtype='int16',
+                    )
+                    stream.start()
+                    if event_logger:
+                        event_logger.log_event(event_logger.TTS_PLAYBACK_START)
+                    chunk = chunk[44:]
+                    header_consumed = True
+
+                chunk_count += 1
+                bytes_received += len(chunk)
+                metrics.chunks_received = chunk_count
+                metrics.chunks_played = chunk_count
+
+                # Combine with any partial frame from the previous iteration,
+                # write only whole frames, carry the remainder forward.
+                merged = leftover + chunk
+                frame_bytes = 2 * channels
+                usable = (len(merged) // frame_bytes) * frame_bytes
+                leftover = merged[usable:]
+                if not usable:
+                    continue
+                audio_array = np.frombuffer(merged[:usable], dtype=np.int16)
+                if channels > 1:
+                    audio_array = audio_array.reshape(-1, channels)
+                stream.write(audio_array)
+                if save_buffer:
+                    save_buffer.write(merged[:usable])
+
+                if debug and chunk_count % 10 == 0:
+                    logger.debug(f"Streamed {chunk_count} chunks, {bytes_received} bytes")
+
+        if leftover:
+            logger.debug(f"Discarding {len(leftover)} trailing bytes (partial frame at EOF)")
+
+        # Pad with trailing silence and explicitly drain before stop(): on macOS
+        # CoreAudio (especially aggregate devices) stream.stop() doesn't reliably
+        # wait for the output buffer to flush, so the last real chunk gets
+        # clipped. Mirrors stream_with_buffering's drain pattern for the same
+        # reason.
+        if stream is not None:
+            if TTS_TRAILING_SILENCE > 0:
+                pad_frames = int(sample_rate * TTS_TRAILING_SILENCE)
+                pad = np.zeros((pad_frames, channels) if channels > 1 else pad_frames, dtype=np.int16)
+                stream.write(pad)
+            drain_secs = (stream.latency or 0.0) + 0.3
+            await asyncio.sleep(drain_secs)
+            stream.stop()
+
         end_time = time.perf_counter()
 
-        # Log TTS playback end with metrics
         if event_logger:
             tts_event_data = {
                 "metrics": {
@@ -334,21 +393,14 @@ async def stream_pcm_audio(
                     "total_time_ms": round((end_time - start_time) * 1000, 1),
                     "bytes_received": bytes_received,
                     "chunks": chunk_count,
-                    "format": "pcm",
-                    "sample_rate_hz": SAMPLE_RATE
+                    "format": format,
+                    "sample_rate_hz": sample_rate,
                 }
             }
             event_logger.log_event(event_logger.TTS_PLAYBACK_END, tts_event_data)
         metrics.generation_time = first_chunk_time - start_time if first_chunk_time else 0
         metrics.playback_time = end_time - start_time
-        
-        # Calculate true TTFA based on actual audio playback or chunk receipt
-        if debug and audio_start_time:
-            # Use actual playback start time when available
-            metrics.ttfa = audio_start_time - start_time
-            logger.info(f"True TTFA (audio started): {metrics.ttfa:.3f}s")
-        elif first_chunk_time:
-            # Fall back to first chunk time
+        if first_chunk_time:
             metrics.ttfa = first_chunk_time - start_time
             logger.info(f"TTFA (first chunk): {metrics.ttfa:.3f}s")
         
@@ -362,16 +414,19 @@ async def stream_pcm_audio(
                 from .core import save_debug_file
                 save_buffer.seek(0)
                 audio_data = save_buffer.read()
-                # PCM format needs special handling - save as WAV
+                # Re-wrap the accumulated raw int16 stream as a self-contained
+                # WAV file for the on-disk artifact — applies whether the wire
+                # format was pcm (no header at all) or wav (header was stripped
+                # off chunk 0 before playback). Reconstructs from the parsed
+                # sample_rate/channels so the saved file matches the played one.
                 if audio_data:
-                    # For PCM, we need to save as WAV with proper headers
                     import wave
                     import tempfile
                     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
                         with wave.open(tmp_wav.name, 'wb') as wav_file:
-                            wav_file.setnchannels(1)
+                            wav_file.setnchannels(channels)
                             wav_file.setsampwidth(2)  # 16-bit
-                            wav_file.setframerate(SAMPLE_RATE)
+                            wav_file.setframerate(sample_rate)
                             wav_file.writeframes(audio_data)
                         # Read back the WAV file
                         with open(tmp_wav.name, 'rb') as f:
@@ -391,7 +446,7 @@ async def stream_pcm_audio(
         return True, metrics
         
     except Exception as e:
-        logger.error(f"PCM streaming failed: {e}")
+        logger.error(f"{format.upper()} streaming failed: {e}")
         return False, metrics
         
     finally:
@@ -421,10 +476,11 @@ async def stream_tts_audio(
     """
     format = request_params.get('response_format', 'pcm')
     logger.info(f"Starting streaming TTS with format: {format}")
-    
-    # PCM is best for streaming (no decoding needed)
-    # For other formats, we may need buffering
-    if format == 'pcm':
+
+    # PCM and WAV are both raw int16 at the wire level (WAV just prepends a
+    # 44-byte RIFF header) so they share a no-decode streaming path. Compressed
+    # formats (mp3, opus, ...) need pydub/ffmpeg framing in stream_with_buffering.
+    if format in ('pcm', 'wav'):
         return await stream_pcm_audio(
             text=text,
             openai_client=openai_client,

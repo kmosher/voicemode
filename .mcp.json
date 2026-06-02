@@ -4,7 +4,8 @@
       "type": "stdio",
       "command": "voicemode-mcp-launcher",
       "env": {
-        "#VOICEMODE_SAVE_ALL": "true"
+        "#VOICEMODE_SAVE_ALL": "true",
+        "VOICEMODE_PAUSE_SPOTIFY_DURING_LISTEN": "1"
       }
     }
   }

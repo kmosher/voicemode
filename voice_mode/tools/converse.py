@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import os
+import subprocess
+import threading
 import time
 import traceback
 from typing import Optional, Literal, Tuple, Dict, Union
@@ -202,6 +204,19 @@ def focus_tmux_pane() -> None:
 DJ_SOCKET_PATH = "/tmp/voicemode-mpv.sock"
 DJ_VOLUME_DUCK_AMOUNT = int(os.environ.get("VOICEMODE_DJ_DUCK_AMOUNT", "20"))  # Volume reduction during TTS
 
+# External-app pausing during the listen leg. Off by default — opt in with the
+# env var. Currently only macOS Spotify is wired up; the pattern extends to
+# any AppleScript-controllable player (Music.app, Podcasts, etc.).
+PAUSE_SPOTIFY_DURING_LISTEN = os.environ.get(
+    "VOICEMODE_PAUSE_SPOTIFY_DURING_LISTEN", ""
+).lower() in ("1", "true", "yes", "on")
+# Delay before resuming Spotify after the listen leg, to let Bluetooth
+# headphones transition out of call mode (HFP) back to A2DP — otherwise
+# the first second of music plays through the call-quality profile.
+SPOTIFY_RESUME_DELAY_SECONDS = float(
+    os.environ.get("VOICEMODE_SPOTIFY_RESUME_DELAY_SECONDS", "1.5")
+)
+
 
 def _dj_command(cmd: str) -> Optional[str]:
     """Send a command to mpv-dj via IPC socket.
@@ -294,6 +309,57 @@ class DJDucker:
             if set_dj_volume(self.original_volume):
                 logger.debug(f"DJ restored: {self.original_volume:.0f}%")
         return False  # Don't suppress exceptions
+
+
+class SpotifyPauser:
+    """Context manager that pauses macOS Spotify during the listen leg and
+    resumes it on exit — but only if Spotify was actually playing on entry.
+
+    Gated by VOICEMODE_PAUSE_SPOTIFY_DURING_LISTEN. Silent no-op on non-macOS
+    or when Spotify isn't running.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled and PAUSE_SPOTIFY_DURING_LISTEN
+        self.was_playing = False
+
+    def _osa(self, script: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=1.0,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        # Probe state without launching Spotify: `running` first, then player_state.
+        running = self._osa('tell application "System Events" to (name of processes) contains "Spotify"')
+        if running != "true":
+            return self
+        state = self._osa('tell application "Spotify" to player state as string')
+        if state == "playing":
+            self.was_playing = True
+            self._osa('tell application "Spotify" to pause')
+            logger.debug("SpotifyPauser: paused")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.was_playing:
+            def _delayed_resume():
+                if SPOTIFY_RESUME_DELAY_SECONDS > 0:
+                    time.sleep(SPOTIFY_RESUME_DELAY_SECONDS)
+                self._osa('tell application "Spotify" to play')
+                logger.debug("SpotifyPauser: resumed")
+            # Run off the event loop so TTS/STT in the main path isn't blocked
+            # while Bluetooth transitions HFP -> A2DP.
+            threading.Thread(target=_delayed_resume, daemon=True).start()
+        return False
 
 
 def should_repeat(text: str) -> bool:
@@ -1339,6 +1405,15 @@ consult the MCP resources listed above.
     # "no override" — fall back to the resolved profile/sidecar transcript.
     resolved_ref_text = resolve_ref_text(ref_text)
 
+    # Signal to the PermissionRequest hook that this Claude session is using
+    # voice, so the hook prompts by voice instead of TTY. Scoped via
+    # $CLAUDE_CODE_TMPDIR; safe no-op if the env var is missing.
+    try:
+        from voice_mode.permission_hook import mark_voice_active
+        mark_voice_active()
+    except Exception as e:
+        logger.debug(f"mark_voice_active failed (non-fatal): {e}")
+
     # Convert vad_aggressiveness to integer if provided as string
     if vad_aggressiveness is not None and isinstance(vad_aggressiveness, str):
         try:
@@ -1700,9 +1775,10 @@ consult the MCP resources listed above.
 
                 record_start = time.perf_counter()
                 logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}")
-                audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
-                )
+                with SpotifyPauser():
+                    audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                        None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                    )
                 timings['record'] = time.perf_counter() - record_start
                 
                 # Log recording end
@@ -1882,9 +1958,10 @@ consult the MCP resources listed above.
 
                         # Record audio
                         record_start = time.perf_counter()
-                        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
-                        )
+                        with SpotifyPauser():
+                            audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                                None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                            )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
 
@@ -1938,9 +2015,10 @@ consult the MCP resources listed above.
 
                         # Record audio
                         record_start = time.perf_counter()
-                        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
-                        )
+                        with SpotifyPauser():
+                            audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                                None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                            )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
 

@@ -2366,6 +2366,28 @@ def mcp_bridge(url: str, token: str | None):
     run_bridge(url, token)
 
 
+@voice_mode_main_cli.command(name="permission-hook", hidden=True)
+@click.help_option('-h', '--help')
+def permission_hook_cmd():
+    """Claude Code PermissionRequest hook entry point (voice yes/no).
+
+    Reads the hook payload on stdin, and — if voice mode is active for the
+    current Claude session — speaks the request and listens for a yes/no
+    answer. Emits the hook's decision JSON on stdout, or exits 0 to fall
+    through to Claude's normal TTY permission prompt.
+
+    Configure in ~/.claude/settings.json:
+
+      { "hooks": { "PermissionRequest": [
+          { "hooks": [{ "type": "command",
+                         "command": "voicemode permission-hook",
+                         "timeout": 600 }] }
+      ]}}
+    """
+    from voice_mode.permission_hook import handle_permission_request
+    handle_permission_request()
+
+
 # Completions command
 @voice_mode_main_cli.command()
 @click.help_option('-h', '--help')

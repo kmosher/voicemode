@@ -113,10 +113,12 @@ def determine_tools_to_load() -> tuple[set[str], str]:
         return tools_to_load, f"legacy mode ({len(tools_to_load)} tools)"
 
     else:
-        # Default - load essential tools only (converse, service)
-        # This provides basic voice interaction and service management
-        # while significantly reducing token usage in Claude Code
-        default_tools = {"converse", "service"}
+        # Default - load essential tools only (converse, service, announce).
+        # converse = two-way voice; service = lifecycle mgmt; announce =
+        # fire-and-forget end-of-task notifications (cheap to keep loaded,
+        # required by the "multiple Claudes call out when they finish"
+        # pattern documented in the voicemode skill).
+        default_tools = {"converse", "service", "announce"}
         tools_to_load = default_tools & all_tools  # Only load tools that exist
         return tools_to_load, f"default mode ({len(tools_to_load)} tools)"
 
