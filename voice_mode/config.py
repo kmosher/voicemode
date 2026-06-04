@@ -698,6 +698,18 @@ KOKORO_MAX_REQUESTS = int(os.getenv("VOICEMODE_KOKORO_MAX_REQUESTS", "25"))
 MLX_AUDIO_HOST = os.getenv("VOICEMODE_MLX_AUDIO_HOST", "127.0.0.1")
 MLX_AUDIO_PORT = int(os.getenv("VOICEMODE_MLX_AUDIO_PORT", "8890"))
 
+# speech-server is the speech-swift fork binary (VoxCPM2 TTS + Parakeet STT on
+# a single port), built out-of-band and installed to /opt/ai-tools/bin. Like
+# mlx-audio, voicemode only manages its launchd lifecycle -- it does not build
+# the binary. The plist sources voicemode.env and reads these at startup, so
+# changes here are picked up at the next service start. The binary releases its
+# resident models after --idle-timeout seconds idle (reloading lazily), so the
+# always-running service is cheap when not in use.
+SPEECH_SERVER_HOST = os.getenv("VOICEMODE_SPEECH_SERVER_HOST", "127.0.0.1")
+SPEECH_SERVER_PORT = int(os.getenv("VOICEMODE_SPEECH_SERVER_PORT", "8893"))
+SPEECH_SERVER_BIN = os.getenv("VOICEMODE_SPEECH_SERVER_BIN", "/opt/ai-tools/bin/speech-server")
+SPEECH_SERVER_IDLE_TIMEOUT = int(os.getenv("VOICEMODE_SPEECH_SERVER_IDLE_TIMEOUT", "900"))
+
 # ==================== IMPRESSIONS CONFIGURATION ====================
 
 # Default Qwen3-TTS model for the impressions feature (voice cloning).

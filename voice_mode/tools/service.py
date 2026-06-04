@@ -12,7 +12,10 @@ from typing import Literal, Optional, Dict, Any, Union
 import psutil
 
 from voice_mode.server import mcp
-from voice_mode.config import WHISPER_PORT, KOKORO_PORT, MLX_AUDIO_PORT, SERVICE_AUTO_ENABLE
+from voice_mode.config import (
+    WHISPER_PORT, KOKORO_PORT, MLX_AUDIO_PORT, SERVICE_AUTO_ENABLE,
+    SPEECH_SERVER_PORT, SPEECH_SERVER_HOST, SPEECH_SERVER_BIN, SPEECH_SERVER_IDLE_TIMEOUT,
+)
 from voice_mode.utils.services.common import find_process_by_port, check_service_status
 
 # Default port for VoiceMode serve command (HTTP MCP server)
@@ -30,6 +33,7 @@ logger = logging.getLogger("voicemode")
 _SERVICE_FILE_NAMES: Dict[str, str] = {
     "voicemode": "serve",
     "mlx_audio": "mlx-audio",
+    "speech_server": "speech-server",
 }
 
 
@@ -103,6 +107,15 @@ def get_service_config_vars(service_name: str) -> Dict[str, Any]:
         return {
             "HOME": home,
         }
+    elif service_name == "speech_server":
+        # speech-server is an out-of-band Swift build (default
+        # /opt/ai-tools/bin); voicemode only manages the launchd lifecycle.
+        # The plist exec's the binary directly, reading bin path / host / port
+        # / idle-timeout from voicemode.env at startup (HOME is only needed for
+        # the log paths in the template).
+        return {
+            "HOME": home,
+        }
     elif service_name == "voicemode":
         # VoiceMode serve service - runs the HTTP MCP server
         start_script = os.path.join(voicemode_dir, "services", "voicemode", "bin", "start-voicemode-serve.sh")
@@ -164,6 +177,13 @@ def load_service_template(service_name: str) -> str:
     if service_name == "mlx_audio" and system != "Darwin":
         raise FileNotFoundError(
             "mlx_audio is macOS-only (MLX requires Apple Silicon); "
+            "no systemd template is shipped."
+        )
+
+    # speech-server (VoxCPM2/Parakeet on MLX+Metal) is Apple-Silicon-only too.
+    if service_name == "speech_server" and system != "Darwin":
+        raise FileNotFoundError(
+            "speech_server is macOS-only (MLX requires Apple Silicon); "
             "no systemd template is shipped."
         )
 
@@ -233,6 +253,9 @@ async def status_service(service_name: str) -> str:
     elif service_name == "mlx_audio":
         port = MLX_AUDIO_PORT
         process_name = None
+    elif service_name == "speech_server":
+        port = SPEECH_SERVER_PORT
+        process_name = "speech-server"
     elif service_name == "voicemode":
         port = VOICEMODE_SERVE_PORT
         process_name = None
@@ -382,6 +405,8 @@ async def start_service(service_name: str) -> str:
         port = KOKORO_PORT
     elif service_name == "mlx_audio":
         port = MLX_AUDIO_PORT
+    elif service_name == "speech_server":
+        port = SPEECH_SERVER_PORT
     elif service_name == "voicemode":
         port = VOICEMODE_SERVE_PORT
     else:
@@ -529,6 +554,23 @@ async def start_service(service_name: str) -> str:
             "--log-dir", str(log_dir),
         ]
 
+    elif service_name == "speech_server":
+        # speech-server is an out-of-band Swift build (default
+        # /opt/ai-tools/bin/speech-server). Match the plist's invocation so the
+        # manual ``service start`` path behaves identically.
+        entry_point = Path(SPEECH_SERVER_BIN)
+        if not entry_point.exists():
+            return (
+                f"❌ speech-server binary not found at {entry_point}. Build/install "
+                "it (speech-swift fork) or set VOICEMODE_SPEECH_SERVER_BIN."
+            )
+        cmd = [
+            str(entry_point),
+            "--host", SPEECH_SERVER_HOST,
+            "--port", str(port),
+            "--idle-timeout", str(SPEECH_SERVER_IDLE_TIMEOUT),
+        ]
+
     elif service_name == "voicemode":
         # Start voicemode serve command directly
         # Use sys.executable to ensure we use the same Python that's running this script
@@ -580,6 +622,8 @@ async def stop_service(service_name: str) -> str:
         port = KOKORO_PORT
     elif service_name == "mlx_audio":
         port = MLX_AUDIO_PORT
+    elif service_name == "speech_server":
+        port = SPEECH_SERVER_PORT
     elif service_name == "voicemode":
         port = VOICEMODE_SERVE_PORT
     else:
@@ -694,6 +738,16 @@ async def enable_service(service_name: str) -> str:
                     f"{entry_point}. Run `voicemode service install mlx-audio` first."
                 )
 
+        elif service_name == "speech_server":
+            # Validate the out-of-band binary exists -- voicemode doesn't build
+            # it, so there's nothing to install here, only a path to check.
+            entry_point = Path(SPEECH_SERVER_BIN)
+            if not entry_point.exists():
+                return (
+                    f"❌ speech-server binary not found at {entry_point}. Build/install "
+                    "it (speech-swift fork) or set VOICEMODE_SPEECH_SERVER_BIN."
+                )
+
         elif service_name == "voicemode":
             start_script = config_vars.get("START_SCRIPT", "")
             if not start_script or not Path(start_script).exists():
@@ -726,7 +780,7 @@ async def enable_service(service_name: str) -> str:
 
         else:  # Linux
             # Map service name to file name (voicemode uses "serve" in file names)
-            file_name = "serve" if service_name == "voicemode" else service_name
+            file_name = _service_file_name(service_name)
             service_unit = f"voicemode-{file_name}.service"
 
             # Reload and enable systemd
@@ -754,8 +808,9 @@ async def disable_service(service_name: str) -> str:
     """Disable a service from starting at boot/login."""
     system = platform.system()
 
-    # Map service name to file name (voicemode uses "serve" in file names)
-    file_name = "serve" if service_name == "voicemode" else service_name
+    # Map service identifier to its on-disk file-name stem (voicemode -> serve,
+    # mlx_audio -> mlx-audio, speech_server -> speech-server, others passthrough).
+    file_name = _service_file_name(service_name)
 
     try:
         if system == "Darwin":
@@ -818,8 +873,9 @@ async def view_logs(service_name: str, lines: Optional[int] = None) -> str:
     system = platform.system()
     lines = lines or 50
 
-    # Map service name to file/log name (voicemode uses "serve" in file names)
-    log_name = "serve" if service_name == "voicemode" else service_name
+    # Map service identifier to its on-disk file/log name stem (voicemode ->
+    # serve, mlx_audio -> mlx-audio, speech_server -> speech-server, ...).
+    log_name = _service_file_name(service_name)
 
     try:
         if system == "Darwin":
@@ -890,16 +946,18 @@ async def view_logs(service_name: str, lines: Optional[int] = None) -> str:
 
 @mcp.tool()
 async def service(
-    service_name: Literal["whisper", "kokoro", "mlx_audio", "voicemode"],
+    service_name: Literal["whisper", "kokoro", "mlx_audio", "speech_server", "voicemode"],
     action: Literal["status", "start", "stop", "restart", "enable", "disable", "logs"] = "status",
     lines: Optional[Union[int, str]] = None
 ) -> str:
     """Unified service management tool for voice mode services.
 
-    Manage Whisper (STT), Kokoro (TTS), and VoiceMode (HTTP MCP server) services.
+    Manage Whisper (STT), Kokoro (TTS), mlx-audio, speech-server (VoxCPM2 TTS +
+    Parakeet STT on one port), and VoiceMode (HTTP MCP server) services.
 
     Args:
-        service_name: The service to manage ("whisper", "kokoro", or "voicemode")
+        service_name: The service to manage ("whisper", "kokoro", "mlx_audio",
+            "speech_server", or "voicemode")
         action: The action to perform (default: "status")
             - status: Show if service is running and resource usage
             - start: Start the service
@@ -961,7 +1019,7 @@ async def install_service(service_name: str) -> Dict[str, Any]:
             template_content = template_content.replace(f"{{{key}}}", str(value))
 
         # Map service name to file name (voicemode uses "serve" in file names)
-        file_name = "serve" if service_name == "voicemode" else service_name
+        file_name = _service_file_name(service_name)
 
         if system == "Darwin":
             # Install launchd plist
@@ -990,7 +1048,7 @@ async def uninstall_service(service_name: str) -> Dict[str, Any]:
         system = platform.system()
 
         # Map service name to file name (voicemode uses "serve" in file names)
-        file_name = "serve" if service_name == "voicemode" else service_name
+        file_name = _service_file_name(service_name)
 
         if system == "Darwin":
             plist_path = Path.home() / "Library" / "LaunchAgents" / f"com.voicemode.{file_name}.plist"

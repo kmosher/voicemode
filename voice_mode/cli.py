@@ -335,9 +335,10 @@ def remove(name, keep_audio):
 #   voicemode service status [service]
 # etc.
 
-# Public CLI service names. ``mlx-audio`` uses kebab-case for ergonomics
-# at the command line; the internal Python identifier is ``mlx_audio``.
-VALID_SERVICES = ['whisper', 'kokoro', 'voicemode', 'mlx-audio']
+# Public CLI service names. ``mlx-audio`` / ``speech-server`` use kebab-case
+# for ergonomics at the command line; the internal Python identifiers are
+# ``mlx_audio`` / ``speech_server`` (see _normalize_service_name).
+VALID_SERVICES = ['whisper', 'kokoro', 'voicemode', 'mlx-audio', 'speech-server']
 
 
 def _normalize_service_name(name: str) -> str:

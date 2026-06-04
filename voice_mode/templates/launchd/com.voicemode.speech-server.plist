@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- com.voicemode.speech-server.plist -->
+<!-- speech-swift speech-server: VoxCPM2 TTS + Parakeet STT on one port. -->
+<!-- Binary built out-of-band (Swift), installed to /opt/ai-tools/bin; voicemode -->
+<!-- only manages its launchd lifecycle (same shape as mlx-audio). -->
+<!-- Sources voicemode.env for VOICEMODE_SPEECH_SERVER_{{BIN,HOST,PORT,IDLE_TIMEOUT}}. -->
+<!--
+  LaunchAgent (not a daemon) on purpose: MLX needs a Metal device, which is only
+  available inside the user's GUI login session. A daemon gets an empty device
+  list and SIGABRTs on first inference. KeepAlive keeps it up and crash-restarted;
+  --idle-timeout makes the binary shed its ~9 GB of resident models after 15 min
+  idle (reloading lazily), so "always running" is cheap when unused.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.voicemode.speech-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>set -a; [ -f "$HOME/.voicemode/voicemode.env" ] &amp;&amp; . "$HOME/.voicemode/voicemode.env"; set +a; exec "${{VOICEMODE_SPEECH_SERVER_BIN:-/opt/ai-tools/bin/speech-server}}" --host "${{VOICEMODE_SPEECH_SERVER_HOST:-127.0.0.1}}" --port "${{VOICEMODE_SPEECH_SERVER_PORT:-8893}}" --idle-timeout "${{VOICEMODE_SPEECH_SERVER_IDLE_TIMEOUT:-900}}"</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>{HOME}/.voicemode/logs/speech-server/speech-server.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>{HOME}/.voicemode/logs/speech-server/speech-server.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>
