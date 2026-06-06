@@ -28,6 +28,7 @@ from .config import (
     logger
 )
 from .utils import get_event_logger, update_latest_symlinks
+from .audio_devices import resolve_output_device, stream_open, stream_closed
 
 
 
@@ -118,15 +119,18 @@ class AudioStreamPlayer:
     
     async def start(self):
         """Start the audio stream."""
+        device, device_name = resolve_output_device()
+        stream_open()
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
             callback=self._audio_callback,
             blocksize=1024,
-            dtype='float32'
+            dtype='float32',
+            device=device,
         )
         self.stream.start()
-        logger.debug("Audio stream started")
+        logger.debug(f"Audio stream started (device={device_name or 'system default'})")
     
     async def add_chunk(self, chunk: bytes) -> bool:
         """Add an audio chunk for playback.
@@ -229,6 +233,8 @@ class AudioStreamPlayer:
         if self.stream:
             self.stream.stop()
             self.stream.close()
+            self.stream = None
+            stream_closed()
         logger.debug("Audio stream stopped")
 
 
@@ -270,12 +276,16 @@ async def stream_pcm_audio(
         # OutputStream creation until the header is parsed so the device matches
         # the file's actual rate/channels.
         if not is_wav:
+            device, device_name = resolve_output_device()
+            stream_open()
             stream = sd.OutputStream(
                 samplerate=SAMPLE_RATE,
                 channels=1,
                 dtype='int16',
+                device=device,
             )
             stream.start()
+            logger.info(f"Playback device: {device_name or 'system default'}")
             if event_logger:
                 event_logger.log_event(event_logger.TTS_PLAYBACK_START)
 
@@ -333,12 +343,16 @@ async def stream_pcm_audio(
                         logger.error(f"Unsupported WAV bits-per-sample: {bits}")
                         return False, metrics
                     logger.info(f"WAV header parsed: {sample_rate}Hz, {channels}ch, 16-bit")
+                    device, device_name = resolve_output_device()
+                    stream_open()
                     stream = sd.OutputStream(
                         samplerate=sample_rate,
                         channels=channels,
                         dtype='int16',
+                        device=device,
                     )
                     stream.start()
+                    logger.info(f"Playback device: {device_name or 'system default'}")
                     if event_logger:
                         event_logger.log_event(event_logger.TTS_PLAYBACK_START)
                     chunk = chunk[44:]
@@ -452,6 +466,7 @@ async def stream_pcm_audio(
     finally:
         if stream:
             stream.close()
+            stream_closed()
 
 
 async def stream_tts_audio(
@@ -534,12 +549,16 @@ async def stream_with_buffering(
     
     try:
         # Setup sounddevice stream
+        device, device_name = resolve_output_device()
+        stream_open()
         stream = sd.OutputStream(
             samplerate=sample_rate,
             channels=1,
-            dtype='float32'
+            dtype='float32',
+            device=device,
         )
         stream.start()
+        logger.info(f"Playback device: {device_name or 'system default'}")
         
         # Don't add stream parameter - Kokoro defaults to true, OpenAI doesn't support it
         
@@ -679,3 +698,4 @@ async def stream_with_buffering(
         if stream:
             stream.stop()
             stream.close()
+            stream_closed()

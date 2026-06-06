@@ -12,6 +12,8 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
+from .audio_devices import resolve_output_device, stream_open, stream_closed
+
 logger = logging.getLogger("voicemode.audio_player")
 
 
@@ -129,14 +131,18 @@ class NonBlockingAudioPlayer:
 
         # Create and start output stream
         try:
+            device, device_name = resolve_output_device()
+            stream_open()
             self.stream = sd.OutputStream(
                 samplerate=sample_rate,
                 channels=channels,
                 callback=self._audio_callback,
                 blocksize=self.buffer_size,
-                dtype=np.float32
+                dtype=np.float32,
+                device=device,
             )
             self.stream.start()
+            logger.debug(f"Playback device: {device_name or 'system default'}")
 
             if blocking:
                 self.wait()
@@ -144,6 +150,14 @@ class NonBlockingAudioPlayer:
         except Exception as e:
             self.playback_error = e
             logger.error(f"Error starting audio playback: {e}")
+            # We called stream_open() above; rebalance the count whether or not
+            # the stream object was created, and close it if it was.
+            if self.stream is not None:
+                try:
+                    self.stream.close()
+                finally:
+                    self.stream = None
+            stream_closed()
             raise
 
     def wait(self, timeout: Optional[float] = None):
@@ -164,6 +178,7 @@ class NonBlockingAudioPlayer:
             self.stream.stop()
             self.stream.close()
             self.stream = None
+            stream_closed()
 
         # Raise any error that occurred during playback
         if self.playback_error:
@@ -176,6 +191,7 @@ class NonBlockingAudioPlayer:
             self.stream.stop()
             self.stream.close()
             self.stream = None
+            stream_closed()
 
         # Clear queue
         if self.audio_queue:

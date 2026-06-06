@@ -745,6 +745,25 @@ SOUNDFONTS_ENABLED = env_bool("VOICEMODE_SOUNDFONTS_ENABLED", True)
 SAMPLE_RATE = 24000  # Standard TTS sample rate for both OpenAI and Kokoro
 CHANNELS = 1
 
+# Audio device selection (see voice_mode/audio_devices.py). Both are
+# comma-separated, case-insensitive name substrings, read at playback/record
+# time. Empty (the default) = always use the current system default device.
+#
+#   VOICEMODE_TTS_PREFERRED_OUTPUT_DEVICES
+#       Playback prefers the first *connected* device matching this list (in
+#       order), else falls back to the system default. Example:
+#       "HUAWEI FreeClip,AirPods" -> use those earbuds when on, speakers otherwise.
+#
+#   VOICEMODE_STT_EXCLUDED_INPUT_DEVICES
+#       The microphone never uses a device matching this list; when the system
+#       default input is excluded, falls back to a built-in mic. Useful to keep
+#       a Bluetooth headset's low-quality HFP mic from being selected (which on
+#       macOS also forces the *output* into narrowband mode). Example:
+#       "HUAWEI FreeClip".
+#
+# voicemode re-initializes PortAudio (only while no stream is open) before
+# resolving, so devices connected *after* the server started are seen.
+
 # ==================== SILENCE DETECTION CONFIGURATION ====================
 
 # Disable silence detection (useful for noisy environments)

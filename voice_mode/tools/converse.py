@@ -82,6 +82,7 @@ from voice_mode.core import (
     play_system_audio
 )
 from voice_mode.audio_player import NonBlockingAudioPlayer
+from voice_mode.audio_devices import resolve_input_device, stream_open, stream_closed, active_stream
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
     get_event_logger,
@@ -904,14 +905,22 @@ def record_audio(duration: float) -> np.ndarray:
     try:
         samples_to_record = int(duration * SAMPLE_RATE)
         logger.debug(f"Recording {samples_to_record} samples...")
-        
-        recording = sd.rec(
-            samples_to_record,
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype=np.int16
-        )
-        sd.wait()
+
+        in_device, in_device_name = resolve_input_device()
+        if in_device_name:
+            logger.debug(f"Recording device: {in_device_name}")
+        stream_open()
+        try:
+            recording = sd.rec(
+                samples_to_record,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype=np.int16,
+                device=in_device,
+            )
+            sd.wait()
+        finally:
+            stream_closed()
         
         flattened = recording.flatten()
         logger.info(f"✓ Recorded {len(flattened)} samples")
@@ -1094,12 +1103,16 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         
         try:
             # Create continuous input stream
-            with sd.InputStream(samplerate=SAMPLE_RATE,
+            in_device, in_device_name = resolve_input_device()
+            if in_device_name:
+                logger.debug(f"Recording device: {in_device_name}")
+            with active_stream(), sd.InputStream(samplerate=SAMPLE_RATE,
                                channels=CHANNELS,
                                dtype=np.int16,
                                callback=audio_callback,
-                               blocksize=chunk_samples):
-                
+                               blocksize=chunk_samples,
+                               device=in_device):
+
                 logger.debug("Started continuous audio stream")
                 
                 while recording_duration < max_duration and not stop_recording:
