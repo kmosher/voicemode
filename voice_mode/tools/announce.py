@@ -16,6 +16,7 @@ coordination.
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import traceback
 from typing import Optional, Set
@@ -24,6 +25,22 @@ from voice_mode.server import mcp
 from voice_mode.tools.converse import text_to_speech_with_failover
 
 logger = logging.getLogger("voicemode")
+
+
+def _default_speed() -> float:
+    """Resting playback speed for announcements when the caller doesn't pass one.
+
+    Announcements are notifications meant to deliver information quickly, so the
+    default is slightly faster than natural (1.3x) — the F5 backend renders this
+    cleanly via its wired `speed` lever. Override with VOICEMODE_ANNOUNCE_SPEED;
+    an explicit `speed=` argument to announce() always wins over both.
+    """
+    raw = os.environ.get("VOICEMODE_ANNOUNCE_SPEED", "1.3")
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid VOICEMODE_ANNOUNCE_SPEED=%r; falling back to 1.3", raw)
+        return 1.3
 
 # Hold strong references to in-flight announcement tasks so the event loop
 # doesn't garbage-collect them mid-flight. Tasks remove themselves on
@@ -100,7 +117,9 @@ async def announce(
       verbatim. Otherwise it's SHA-256-hashed into a stable `claude_<hex>`
       ID — pass your session ID or any other stable seed and you'll get a
       deterministic unique voice. Omit to use the default.
-    • speed (optional): 0.25-4.0, where 1.0 is normal.
+    • speed (optional): 0.25-4.0, where 1.0 is normal. Defaults to 1.3
+      (slightly fast — announcements are meant to be heard quickly);
+      override the default with VOICEMODE_ANNOUNCE_SPEED.
     • wait (optional, default False): if True, do NOT return until synthesis
       AND playback have finished — turning this into a blocking call. The usual
       fire-and-forget behavior (return in <100ms) is the default; set wait=True
@@ -123,6 +142,11 @@ async def announce(
 
     resolved_voice = _resolve_voice(voice)
     voice_note = f" voice={resolved_voice}" if resolved_voice else ""
+
+    # Apply the slightly-fast announcement default when the caller didn't
+    # specify a speed. An explicit speed (including 1.0) always wins.
+    if speed is None:
+        speed = _default_speed()
 
     if wait:
         # Blocking mode: await the full TTS + playback pipeline so the caller
