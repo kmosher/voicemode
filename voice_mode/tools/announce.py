@@ -76,6 +76,7 @@ async def announce(
     message: str,
     voice: Optional[str] = None,
     speed: Optional[float] = None,
+    wait: bool = False,
 ) -> str:
     """Fire-and-forget voice announcement. Returns immediately; speech plays in background.
 
@@ -100,6 +101,11 @@ async def announce(
       ID — pass your session ID or any other stable seed and you'll get a
       deterministic unique voice. Omit to use the default.
     • speed (optional): 0.25-4.0, where 1.0 is normal.
+    • wait (optional, default False): if True, do NOT return until synthesis
+      AND playback have finished — turning this into a blocking call. The usual
+      fire-and-forget behavior (return in <100ms) is the default; set wait=True
+      when the caller needs a reliable "playback done" signal, e.g. to play a
+      sequence of clips back-to-back without overlap (handy for A/B debugging).
 
     WHEN TO USE THIS vs converse:
     • USE announce: end-of-task summaries, "build is done", "PR merged",
@@ -116,11 +122,19 @@ async def announce(
         return "✗ announce: empty message, nothing scheduled"
 
     resolved_voice = _resolve_voice(voice)
+    voice_note = f" voice={resolved_voice}" if resolved_voice else ""
+
+    if wait:
+        # Blocking mode: await the full TTS + playback pipeline so the caller
+        # gets a real completion signal. _speak_in_background swallows errors,
+        # so this resolves once audio has actually finished playing.
+        await _speak_in_background(message, resolved_voice, speed)
+        return f"✓ done{voice_note}"
+
     task = asyncio.create_task(
         _speak_in_background(message, resolved_voice, speed)
     )
     _pending.add(task)
     task.add_done_callback(_pending.discard)
 
-    voice_note = f" voice={resolved_voice}" if resolved_voice else ""
     return f"✓ scheduled{voice_note}"

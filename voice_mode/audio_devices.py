@@ -7,8 +7,12 @@ server started is invisible to playback/recording until PortAudio is
 re-initialized. The symptom is audio that keeps going to the device that was
 default at startup (e.g. built-in speakers) even after you switch outputs.
 
-This module re-initializes PortAudio so resolution reflects the *current*
-system state, then applies two name-based policies:
+This module re-initializes PortAudio *lazily* — only when the device a policy
+asks for isn't already in the current enumeration (i.e. it may have been
+hot-plugged) — so it can be discovered. It deliberately does NOT re-init on the
+common already-connected path: terminating PortAudio mid-session can clip the
+start of Bluetooth playback as the A2DP device re-wakes. It applies two
+name-based policies:
 
   * Output (``resolve_output_device``): prefer the first connected device whose
     name matches one of ``VOICEMODE_TTS_PREFERRED_OUTPUT_DEVICES`` (comma-
@@ -94,23 +98,51 @@ def _name(dev) -> str:
     return str(dev.get("name", ""))
 
 
+def _find_output(devices, prefs) -> Tuple[Optional[int], Optional[str]]:
+    for sub in prefs:
+        low = sub.lower()
+        for idx, dev in enumerate(devices):
+            if dev.get("max_output_channels", 0) > 0 and low in _name(dev).lower():
+                return idx, _name(dev)
+    return None, None
+
+
 def resolve_output_device() -> Tuple[Optional[int], Optional[str]]:
     """Return ``(index, name)`` for playback, or ``(None, None)`` to use the
     system default. Prefers a connected device matching
     ``VOICEMODE_TTS_PREFERRED_OUTPUT_DEVICES``."""
     prefs = _csv_env("VOICEMODE_TTS_PREFERRED_OUTPUT_DEVICES")
-    with _lock:
-        _refresh_if_idle()
-        if not prefs:
-            return None, None
-        devices = sd.query_devices()
-        for sub in prefs:
-            low = sub.lower()
-            for idx, dev in enumerate(devices):
-                if dev.get("max_output_channels", 0) > 0 and low in _name(dev).lower():
-                    logger.debug("voicemode: output device -> [%d] %s (pref %r)", idx, _name(dev), sub)
-                    return idx, _name(dev)
+    if not prefs:
         return None, None
+    with _lock:
+        idx, name = _find_output(sd.query_devices(), prefs)
+        if idx is None:
+            # Preferred device isn't in the current enumeration; it may have been
+            # hot-plugged. Re-init once (idle only) to discover it, then retry.
+            _refresh_if_idle()
+            idx, name = _find_output(sd.query_devices(), prefs)
+        if idx is not None:
+            logger.debug("voicemode: output device -> [%d] %s", idx, name)
+            return idx, name
+        return None, None
+
+
+def _pick_input(devices, excl) -> Tuple[Optional[int], Optional[str]]:
+    def allowed(dev) -> bool:
+        return dev.get("max_input_channels", 0) > 0 and not any(
+            s in _name(dev).lower() for s in excl
+        )
+
+    # Prefer an obvious built-in microphone.
+    for hint in ("macbook", "built-in", "built in", "internal"):
+        for idx, dev in enumerate(devices):
+            if allowed(dev) and hint in _name(dev).lower():
+                return idx, _name(dev)
+    # Otherwise the first non-excluded input.
+    for idx, dev in enumerate(devices):
+        if allowed(dev):
+            return idx, _name(dev)
+    return None, None
 
 
 def resolve_input_device() -> Tuple[Optional[int], Optional[str]]:
@@ -119,34 +151,24 @@ def resolve_input_device() -> Tuple[Optional[int], Optional[str]]:
     ``VOICEMODE_STT_EXCLUDED_INPUT_DEVICES`` (e.g. a Bluetooth headset mic),
     falling back to a built-in mic / the first non-excluded input."""
     excl = [s.lower() for s in _csv_env("VOICEMODE_STT_EXCLUDED_INPUT_DEVICES")]
+    if not excl:
+        return None, None
     with _lock:
-        _refresh_if_idle()
-        if not excl:
-            return None, None
         try:
             default_name = _name(sd.query_devices(kind="input"))
         except Exception:
             default_name = ""
         if default_name and not any(s in default_name.lower() for s in excl):
             return None, None  # current default is acceptable
-        devices = sd.query_devices()
-
-        def allowed(dev) -> bool:
-            return dev.get("max_input_channels", 0) > 0 and not any(
-                s in _name(dev).lower() for s in excl
-            )
-
-        # Prefer an obvious built-in microphone.
-        for hint in ("macbook", "built-in", "built in", "internal"):
-            for idx, dev in enumerate(devices):
-                if allowed(dev) and hint in _name(dev).lower():
-                    logger.debug("voicemode: input device -> [%d] %s (built-in)", idx, _name(dev))
-                    return idx, _name(dev)
-        # Otherwise the first non-excluded input.
-        for idx, dev in enumerate(devices):
-            if allowed(dev):
-                logger.debug("voicemode: input device -> [%d] %s (first allowed)", idx, _name(dev))
-                return idx, _name(dev)
+        idx, name = _pick_input(sd.query_devices(), excl)
+        if idx is None:
+            # No acceptable input in the current enumeration; re-init once (idle
+            # only) in case a usable mic was hot-plugged, then retry.
+            _refresh_if_idle()
+            idx, name = _pick_input(sd.query_devices(), excl)
+        if idx is not None:
+            logger.debug("voicemode: input device -> [%d] %s", idx, name)
+            return idx, name
         # Nothing better available; let the default ride rather than fail.
         logger.warning(
             "voicemode: default input %r is excluded but no alternative input found; using default",
